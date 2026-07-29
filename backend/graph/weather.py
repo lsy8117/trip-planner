@@ -13,24 +13,16 @@ from langchain_core.tools import tool
 
 import requests
 import httpx
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
-# from backend.models import DayWeatherInfo
+from backend.models import DayWeatherInfo
 # from backend.tools.weather import tools  # your existing weather tools
 from backend.utilities import get_llm
+from backend.config import settings
 
 # ─────────────────────────────────────────────
 # Sub-graph state (private to this subgraph)
 # ─────────────────────────────────────────────
-
-class DayWeatherInfo(BaseModel):
-    location: str = Field(..., examples=["Chicago"])
-    date: str = Field(..., examples=["2026-06-20"])
-    temp_min_c: Optional[float] = None
-    temp_max_c: Optional[float] = None
-    precipitation_mm: Optional[float] = None
-    condition: Optional[str] = None
-    error: Optional[str] = None
 
 class WeatherState(TypedDict):
     # Input fields (written by orchestrator before invoking)
@@ -56,6 +48,12 @@ class WeatherOutput(TypedDict):
 # Weather tool 
 # ─────────────────────────────────────────────
 
+# Open-Meteo's free forecast endpoint only covers today .. today+15 days; requesting
+# beyond that returns a 400. Requests further out get clipped to this window and the
+# clipped-off days are reported back per-day as unavailable instead of failing outright.
+MAX_FORECAST_DAYS = 15
+
+
 @tool
 def get_weather_forecast(city: str, start_date: str, end_date: str) -> dict:
     """
@@ -67,12 +65,14 @@ def get_weather_forecast(city: str, start_date: str, end_date: str) -> dict:
         end_date: "YYYY-MM-DD"
 
     Returns:
-        dict with city info and a list of daily forecasts.
+        dict with city info and a list of daily forecasts. Dates beyond the forecast
+        provider's supported range (more than 15 days from today) come back with an
+        "error" field instead of weather data, rather than failing the whole request.
     """
     # validate dates
     try:
-        d1 = datetime.strptime(start_date, "%Y-%m-%d")
-        d2 = datetime.strptime(end_date, "%Y-%m-%d")
+        d1 = datetime.strptime(start_date, "%Y-%m-%d").date()
+        d2 = datetime.strptime(end_date, "%Y-%m-%d").date()
     except ValueError:
         raise ValueError("Dates must be in YYYY-MM-DD format")
     if d2 < d1:
@@ -94,36 +94,93 @@ def get_weather_forecast(city: str, start_date: str, end_date: str) -> dict:
     lat, lon = place["latitude"], place["longitude"]
     resolved_name = place.get("name", city)
 
-    # step 2: fetch forecast for date range
-    forecast_resp = requests.get(
+    # step 2: fetch forecast for date range, falling back to a clipped range if the
+    # provider rejects it as too far out
+    forecast_days, unavailable_reasons = _fetch_forecast_days(lat, lon, d1, d2)
+
+    forecast = []
+    for day in _date_range(d1, d2):
+        day_str = day.isoformat()
+        if day_str in forecast_days:
+            forecast.append({"date": day_str, **forecast_days[day_str]})
+        else:
+            forecast.append({
+                "date": day_str,
+                "error": unavailable_reasons.get(day_str, "Forecast unavailable for this date"),
+            })
+
+    return {"city": resolved_name, "latitude": lat, "longitude": lon, "forecast": forecast}
+
+
+def _date_range(start: date, end: date):
+    for i in range((end - start).days + 1):
+        yield start + timedelta(days=i)
+
+
+def _request_forecast_daily(lat: float, lon: float, start: date, end: date) -> dict:
+    resp = requests.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
             "latitude": lat,
             "longitude": lon,
-            "start_date": start_date,
-            "end_date": end_date,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
             "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode",
             "timezone": "auto",
         },
         timeout=10,
     )
-    forecast_resp.raise_for_status()
-    daily = forecast_resp.json().get("daily", {})
+    resp.raise_for_status()
+    return resp.json().get("daily", {})
 
-    if not daily:
-        raise ValueError("No forecast data returned for the given dates")
 
-    forecast = []
-    for i, date in enumerate(daily["time"]):
-        forecast.append({
-            "date": date,
+def _fetch_forecast_days(
+    lat: float, lon: float, start: date, end: date
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """
+    Request the forecast for [start, end], retrying with a range clipped to
+    today+MAX_FORECAST_DAYS if the provider 400s the original range.
+
+    Returns (date_str -> parsed day dict, date_str -> reason unavailable).
+    """
+    max_available_date = date.today() + timedelta(days=MAX_FORECAST_DAYS)
+
+    try:
+        daily = _request_forecast_daily(lat, lon, start, end)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status != 400:
+            raise
+
+        unavailable_reasons = {
+            day.isoformat(): (
+                f"Forecast unavailable: more than {MAX_FORECAST_DAYS} days from today, "
+                "beyond the forecast provider's supported range."
+            )
+            for day in _date_range(max(start, max_available_date + timedelta(days=1)), end)
+            if day > max_available_date
+        }
+
+        if start > max_available_date:
+            # Nothing in the requested range is fetchable at all.
+            return {}, unavailable_reasons
+
+        daily = _request_forecast_daily(lat, lon, start, max_available_date)
+        return _parse_daily(daily), unavailable_reasons
+
+    return _parse_daily(daily), {}
+
+
+def _parse_daily(daily: dict) -> dict[str, dict]:
+    parsed = {}
+    for i, day_str in enumerate(daily.get("time", [])):
+        parsed[day_str] = {
             "temp_max_c": daily["temperature_2m_max"][i],
             "temp_min_c": daily["temperature_2m_min"][i],
             "precipitation_mm": daily["precipitation_sum"][i],
             "condition": _weathercode_to_text(daily["weathercode"][i]),
-        })
-
-    return {"city": resolved_name, "latitude": lat, "longitude": lon, "forecast": forecast}
+        }
+    return parsed
 
 
 def _weathercode_to_text(code: int) -> str:
@@ -163,10 +220,11 @@ Do not come out with weather information on your own.
 ** Output **
 Present any weather information found with short, succinct descriptive text. 
 Do not return anything else.
+If weather information is unavailable, return a message indicating that the weather information is unavailable.
 """
 
 def _build_weather_agent():
-    llm = get_llm()  # called inside node factory, not at module level
+    llm = get_llm(provider=settings.weather_model_provider, model=settings.weather_model)  # called inside node factory, not at module level
     llm_w_tools = llm.bind_tools(tools)
 
     async def weather_agent(state: WeatherState):
@@ -219,10 +277,11 @@ async def parse_weather_results(state: WeatherState) -> dict:
         DayWeatherInfo(
             location=location,
             date=entry["date"],
-            temp_min_c=entry["temp_min_c"],
-            temp_max_c=entry["temp_max_c"],
-            precipitation_mm=entry["precipitation_mm"],
-            condition=entry["condition"],
+            temp_min_c=entry.get("temp_min_c"),
+            temp_max_c=entry.get("temp_max_c"),
+            precipitation_mm=entry.get("precipitation_mm"),
+            condition=entry.get("condition"),
+            error=entry.get("error"),
         )
         for entry in tool_result["forecast"]
     ]

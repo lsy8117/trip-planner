@@ -14,61 +14,19 @@ from operator import add
  
 from langchain_core.messages import BaseMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+
 from langgraph.types import Send
- 
-from backend.models import AttractionInfo, DayWeatherInfo, HotelInfo, PlannedItinerary
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import MemorySaver
+
+from backend.models import AttractionInfo, OrchestratorState, DayWeatherInfo, HotelInfo, PlannedItinerary, TripIntent
 from backend.graph.weather import weather_subgraph
 from backend.graph.attraction import attraction_subgraph
 from backend.graph.hotel import hotel_subgraph
-from backend.graph.itinerary import build_itinerary_node
- 
- 
-# ─────────────────────────────────────────────
-# Reducer for attractions (dedup by name)
-# ─────────────────────────────────────────────
- 
-def merge_attractions(
-    existing: list[AttractionInfo],
-    incoming: list[AttractionInfo],
-) -> list[AttractionInfo]:
-    by_name = {a.name: a for a in existing}
-    for a in incoming:
-        by_name[a.name] = a
-    return list(by_name.values())
- 
- 
-# ─────────────────────────────────────────────
-# Orchestrator state
-# ─────────────────────────────────────────────
- 
-class OrchestratorState(TypedDict):
-    # Conversation messages (user query lives here as HumanMessage)
-    messages: Annotated[list[BaseMessage], add_messages]
-    current_intent: Optional[TripIntent]      # the active parsed intent
-    current_itinerary: Optional[PlannedItinerary]  # the itinerary being refined
-    refinement_request: Optional[str] 
- 
-    # Raw user query string passed into each subgraph
-    user_query: str
+from backend.graph.itinerary import build_itinerary_node, build_itinerary_patch_node
+from backend.graph.respond import respond
+from backend.graph.classify_request import classify_request
 
-    subgraphs_to_run: list[str]
- 
-    # Results written by each subgraph
-    weather_info: Annotated[list[DayWeatherInfo], add]
-    attractions: Annotated[list[AttractionInfo], merge_attractions]
-    hotels: Annotated[list[HotelInfo], add]
- 
-    # Errors collected across subgraphs (concurrent-safe)
-    errors: Annotated[list[str], add]
- 
-    # Execution plan: list of agent names (or lists of names for parallel groups)
-    # e.g. ["weather", "attractions", "hotels"]  — fully sequential
-    # e.g. [["weather", "attractions"], "hotels"] — parallel first group, then hotels
-    execution_plan: list
-    itinerary: PlannedItinerary | None 
- 
- 
 # ─────────────────────────────────────────────
 # Plan node
 # ─────────────────────────────────────────────
@@ -106,13 +64,14 @@ def route_next(state: OrchestratorState) -> str | list:
     """
     plan = state.get("execution_plan") or []
 
-    if not plan:
-        return "itinerary"
-
+    # if not plan:
+    #     if state.get("change_scope") == "minor_edit":
+    #         return "itinerary_patch"
+    #     return "itinerary"
     next_step = plan[0]
 
     if isinstance(next_step, list):
-        return [Send(agent, state) for agent in next_step]
+        return [Send(agent, {**state, "execution_plan": plan[1:]}) for agent in next_step]
 
     return next_step
  
@@ -148,13 +107,26 @@ def make_weather_node(subgraph):
  
 def make_attraction_node(subgraph):
     async def attraction_node(state: OrchestratorState) -> dict:
+        past_queries = state.get("attraction_search_history") or []
+        trip_intent = state.get("current_intent")
+        # getattr with a default handles both trip_intent being None (first turn before
+        # classify_request runs) and attraction_preferences not yet being a TripIntent field.
+        attraction_requirements = getattr(trip_intent, "attraction_requirements", None) or []
+        attraction_preferences = getattr(trip_intent, "attraction_preferences", None) or []
         result = await subgraph.ainvoke({
             "user_query": state["user_query"],
             # Pass weather_info if available so the attraction agent can consider it
             "weather_info": state.get("weather_info") or [],
+            "past_search_queries": past_queries,
+            "attraction_requirements": attraction_requirements,
+            "attraction_preferences": attraction_preferences,
         })
+        new_queries = result.get("search_queries_used") or []
         return {
             "attractions": result.get("attractions") or [],
+            # Only append queries not already recorded — add-reducer would otherwise
+            # accumulate duplicates if the agent re-runs an old query anyway.
+            "attraction_search_history": [q for q in new_queries if q not in past_queries],
             "execution_plan": _pop_plan(state),
         }
     return attraction_node
@@ -178,50 +150,45 @@ def make_hotel_node(subgraph):
 # Graph assembly
 # ─────────────────────────────────────────────
 
-def build_orchestrator() -> StateGraph:
+def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
+    """checkpointer defaults to an in-memory MemorySaver (lost on restart).
+    Pass a persistent one (e.g. AsyncSqliteSaver — see graph/session_graph.py)
+    for conversations that must survive a process restart."""
     builder = StateGraph(OrchestratorState)
 
-    builder.add_node("initialize_plan", initialize_plan)
-    builder.add_node("itinerary", build_itinerary_node())
-    builder.add_node("weather", make_weather_node(weather_subgraph))
-    builder.add_node("attractions", make_attraction_node(attraction_subgraph))
-    builder.add_node("hotels", make_hotel_node(hotel_subgraph))
+    # Wrap subgraphs so they map state and pop the plan
+    weather_node = make_weather_node(weather_subgraph)
+    attraction_node = make_attraction_node(attraction_subgraph)
+    hotel_node = make_hotel_node(hotel_subgraph)
+    itinerary_node = build_itinerary_node()
+    
 
-    # initialize_plan runs exactly once
-    builder.add_edge(START, "initialize_plan")
+    builder.add_node("classify_request", classify_request)
+    builder.add_node("weather", weather_node)
+    builder.add_node("attraction", attraction_node)
+    builder.add_node("hotel", hotel_node)
+    builder.add_node("itinerary", itinerary_node)
+    builder.add_node("itinerary_patch", build_itinerary_patch_node())
+    builder.add_node("respond", respond)
 
-    # After init, route to first agent
-    builder.add_conditional_edges(
-        "initialize_plan",
-        route_next,
-        {"weather": "weather", "attractions": "attractions",
-         "hotels": "hotels", "itinerary": "itinerary"},
-    )
+    targets = {"weather": "weather", "attraction": "attraction",
+               "hotel": "hotel", "itinerary": "itinerary", "itinerary_patch": "itinerary_patch"}
 
-    # After each subgraph, route directly — no more plan_execution in the loop
-    builder.add_conditional_edges(
-        "weather", route_next,
-        {"weather": "weather", "attractions": "attractions",
-         "hotels": "hotels", "itinerary": "itinerary"},
-    )
-    builder.add_conditional_edges(
-        "attractions", route_next,
-        {"weather": "weather", "attractions": "attractions",
-         "hotels": "hotels", "itinerary": "itinerary"},
-    )
-    builder.add_conditional_edges(
-        "hotels", route_next,
-        {"weather": "weather", "attractions": "attractions",
-         "hotels": "hotels", "itinerary": "itinerary"},
-    )
+    builder.add_edge(START, "classify_request")
 
-    builder.add_edge("itinerary", END)
+    builder.add_conditional_edges("classify_request", route_next, targets)
+    builder.add_conditional_edges("weather", route_next, targets)
+    builder.add_conditional_edges("attraction", route_next, targets)
+    builder.add_conditional_edges("hotel", route_next, targets)
 
-    return builder.compile()
- 
- 
-orchestrator = build_orchestrator()
- 
+    builder.add_edge("itinerary", "respond")
+    builder.add_edge("itinerary_patch", "respond")
+    builder.add_edge("respond", "classify_request")
+
+    return builder.compile(checkpointer=checkpointer or MemorySaver())
+
+
+orchestrator = build_graph()
  
 # ─────────────────────────────────────────────
 # Entry point helper
@@ -231,13 +198,19 @@ async def plan_trip(user_query: str) -> OrchestratorState:
     """Convenience wrapper for invoking the orchestrator."""
     initial_state: OrchestratorState = {
         "messages": [HumanMessage(content=user_query)],
+        "current_intent": None,
+        "current_itinerary": None,
+        "refinement_request": [],
+        "itinerary_edit_instruction": None,
+        "subgraphs_to_run": [],
         "user_query": user_query,
         "weather_info": [],
         "attractions": [],
         "hotels": [],
+        "attraction_search_history": [],
         "errors": [],
         "execution_plan": [],      # will be populated by plan_execution node
-        "itinerary": None, 
     }
     return await orchestrator.ainvoke(initial_state)
- 
+
+

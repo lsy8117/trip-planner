@@ -4,13 +4,13 @@ from typing_extensions import TypedDict
 
 import httpx
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
+from langchain_core.tools import ToolException, tool
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from backend.config import settings
-from backend.utilities import get_llm
+from backend.utilities import get_llm, resilient, tool_error_handler, make_check_tool_results, make_route_after_tools, make_give_up_node
 from backend.models import AttractionInfo, DayWeatherInfo, HotelInfo, HotelOffer
 
 # ─────────────────────────────────────────────
@@ -18,6 +18,7 @@ from backend.models import AttractionInfo, DayWeatherInfo, HotelInfo, HotelOffer
 # ─────────────────────────────────────────────
 
 @tool
+@resilient(max_transient_retries=3, base_delay=1.0)
 async def search_hotels(
     city: str,
     chk_in: str,
@@ -46,48 +47,77 @@ async def search_hotels(
         "X-RapidAPI-Host": "xotelo-hotel-prices.p.rapidapi.com",
     }
 
+    hotels: list[dict] = []
+    seen_keys: set[str] = set()
+
     async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+
+        async def _collect(candidates: list[dict]) -> None:
+            """Fetch rates for candidates, keeping only hotels with an available offer, until `limit` is reached."""
+            for h in candidates:
+                if len(hotels) >= limit:
+                    break
+
+                hotel_key = h.get("hotel_key") or h.get("key")
+                if not hotel_key or hotel_key in seen_keys:
+                    continue
+                seen_keys.add(hotel_key)
+
+                r = await client.get(f"{BASE}/api/rates", params={
+                    "hotel_key": hotel_key,
+                    "chk_in": chk_in,
+                    "chk_out": chk_out,
+                    "adults": adults,
+                })
+                r.raise_for_status()
+                rates = (r.json().get("result") or {}).get("rates", [])
+                offers = [{"ota": rate.get("name"), "price_usd": rate.get("rate")} for rate in rates if rate.get("rate") is not None]
+
+                if not offers:
+                    continue  # no available offers for this hotel — skip it
+
+                hotels.append({
+                    "name": h.get("name"),
+                    "hotel_key": hotel_key,
+                    "rating": h.get("rating"),
+                    "address": h.get("address"),
+                    "offers": offers,
+                })
+
         # Step 1: search hotels by city name directly (accommodation search returns hotel_key per item)
         r = await client.get(f"{BASE}/api/search", params={"query": city, "location_type": "accommodation"})
         r.raise_for_status()
-        data = r.json()
-        search_list = (data.get("result") or {}).get("list", [])
+        search_list = (r.json().get("result") or {}).get("list", [])
+        await _collect(search_list)
 
-        if not search_list:
-            # Fallback: try /api/list with a geo search for location_key
+        # Step 2: if the accommodation search didn't yield enough hotels with offers, escalate
+        # to a geo-based /api/list search with a growing pool, until we hit `limit` or the API
+        # stops returning new candidates (i.e. no further information is available).
+        if len(hotels) < limit:
             r2 = await client.get(f"{BASE}/api/search", params={"query": city, "location_type": "geo"})
             r2.raise_for_status()
             geo_list = (r2.json().get("result") or {}).get("list", [])
+
             if not geo_list:
-                return {"error": f"Location not found: {city}", "hotels": []}
-            location_key = geo_list[0]["location_key"]
-            r3 = await client.get(f"{BASE}/api/list", params={"location_key": location_key, "limit": limit, "sort": sort})
-            r3.raise_for_status()
-            search_list = (r3.json().get("result") or {}).get("list", [])
+                if not hotels:
+                    return {"error": f"Location not found: {city}", "hotels": []}
+            else:
+                location_key = geo_list[0]["location_key"]
+                pool_size = max(limit * 4, 20)
+                max_pool = 200
+                prev_len = -1
+                while len(hotels) < limit:
+                    r3 = await client.get(f"{BASE}/api/list", params={"location_key": location_key, "limit": pool_size, "sort": sort})
+                    r3.raise_for_status()
+                    list_result = (r3.json().get("result") or {}).get("list", [])
+                    await _collect(list_result)
 
-        # Step 2: fetch rates for each hotel
-        hotels = []
-        for h in search_list[:limit]:
-            hotel_key = h.get("hotel_key") or h.get("key")
-            if not hotel_key:
-                continue
-
-            r = await client.get(f"{BASE}/api/rates", params={
-                "hotel_key": hotel_key,
-                "chk_in": chk_in,
-                "chk_out": chk_out,
-                "adults": adults,
-            })
-            r.raise_for_status()
-            rates = (r.json().get("result") or {}).get("rates", [])
-
-            hotels.append({
-                "name": h.get("name"),
-                "hotel_key": hotel_key,
-                "rating": h.get("rating"),
-                "address": h.get("address"),
-                "offers": [{"ota": rate.get("name"), "price_usd": rate.get("rate")} for rate in rates],
-            })
+                    if len(hotels) >= limit:
+                        break
+                    if len(list_result) < pool_size or len(list_result) == prev_len or pool_size >= max_pool:
+                        break  # API has no more candidates to offer
+                    prev_len = len(list_result)
+                    pool_size = min(pool_size * 2, max_pool)
 
     return {"city": city, "chk_in": chk_in, "chk_out": chk_out, "hotels": hotels}
 
@@ -154,7 +184,7 @@ step.
 # ─────────────────────────────────────────────
 
 def _build_hotel_agent():
-    llm_w_hotel_tools = get_llm().bind_tools(hotel_tools)
+    llm_w_hotel_tools = get_llm(provider=settings.hotel_model_provider, model=settings.hotel_model).bind_tools(hotel_tools)
 
     async def hotel_agent(state: HotelState) -> dict:
         # Inject available context into the user query
@@ -226,9 +256,16 @@ def build_hotel_subgraph() -> StateGraph:
 
     builder = StateGraph(HotelState, input=HotelInput, output=HotelOutput)
 
+    check_tool_results = make_check_tool_results()
+    route_after_tools = make_route_after_tools(agent_node="hotel_agent")
+    give_up = make_give_up_node({"hotels": []})
+
     builder.add_node("hotel_agent", hotel_agent)
-    builder.add_node("tools", ToolNode(hotel_tools))
+    builder.add_node("tools", ToolNode(hotel_tools, handle_tool_errors=tool_error_handler))
     builder.add_node("parse_hotel_results", parse_hotel_results)
+
+    builder.add_node("check_tool_results", check_tool_results)
+    builder.add_node("give_up", give_up)
 
     builder.set_entry_point("hotel_agent")
 
@@ -240,7 +277,12 @@ def build_hotel_subgraph() -> StateGraph:
             "parse_hotel_results": "parse_hotel_results",
         },
     )
-    builder.add_edge("tools", "hotel_agent")           # loop: agent reviews results, decides if done
+    builder.add_edge("tools", "check_tool_results")
+    builder.add_conditional_edges("check_tool_results", route_after_tools, {
+        "hotel_agent": "hotel_agent",
+        "give_up": "give_up",
+    })
+    builder.add_edge("give_up", END)
     builder.add_edge("parse_hotel_results", END)       # structured output ready, exit
 
     return builder.compile()

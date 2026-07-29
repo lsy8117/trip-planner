@@ -20,17 +20,48 @@ class Settings(BaseSettings):
     # ollama_model: str = "llama3.2"
     # llamacpp_model_path: str = ""
 
-    # # Telegram
-    # telegram_bot_token: str
+    ## classify_request LLM
+    classify_request_model: str = "qwen/qwen3.6-27b"
+    classify_request_model_provider: str = "groq"
+
+    ## weather agent LLM
+    weather_model: str = "openai/gpt-oss-20b"
+    weather_model_provider: str = "groq"
+
+    ## attraction agent LLM 
+    attraction_model: str = "openai/gpt-oss-20b"
+    attraction_model_provider: str = "groq"
+    extraction_model: str = "openai/gpt-oss-120b"
+    extraction_model_provider: str = "groq"
+
+    ## hotel agent LLM
+    hotel_model: str = "openai/gpt-oss-20b"
+    hotel_model_provider: str = "groq"
+
+    ## itinerary agent LLM
+    itinerary_model: str = "llama-3.3-70b-versatile"
+    itinerary_model_provider: str = "groq"
+
+    ## itinerary patch LLM
+    itinerary_patch_model: str = "llama-3.3-70b-versatile"
+    itinerary_patch_model_provider: str = "groq"
+
+    ## memory update LLM
+    memory_update_model: str = "openai/gpt-oss-20b"
+    memory_update_model_provider: str = "groq"
 
     # Tools
     tavily_api_key: str = ""
     openweathermap_api_key: str = ""
     rapidapi_key: str = ""
-    # amadeus_api_key: str = ""
-    # amadeus_api_secret: str = ""
-    # google_places_api_key: str = ""
     google_maps_api_key: str = ""
+
+    # Frontend
+    telegram_bot_token: str = ""
+
+    sessions_dir: Path = ROOT_DIR / "backend" / "sessions"
+
+    memory_dir: Path = ROOT_DIR / "backend" / "memory" / "data"
 
 
 # Singleton instance — import this everywhere instead of re-instantiating

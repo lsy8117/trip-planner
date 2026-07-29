@@ -14,3 +14,7 @@ backend/.env
 .env
 
 /frontend
+
+/backend/sessions
+/backend/logs
+/backend/memory/data
